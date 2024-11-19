@@ -2,6 +2,7 @@
 <html>
 <head>
     <title>Cyber ID Lookup</title>
+    <script src="https://cdn.jsdelivr.net/npm/web3@1.10.0/dist/web3.min.js"></script>
     <style>
         .container {
             width: 600px;
@@ -26,16 +27,12 @@
             border-radius: 4px;
             cursor: pointer;
         }
-        #result {
-            margin-top: 20px;
-            padding: 15px;
-            text-align: left;
-        }
         .cyber-id-card {
             border: 1px solid #eee;
             border-radius: 8px;
             padding: 15px;
             margin-top: 15px;
+            text-align: left;
         }
         .cyber-id-image {
             max-width: 200px;
@@ -45,14 +42,8 @@
         .cyber-id-name {
             font-size: 24px;
             font-weight: bold;
-            margin: 10px 0;
             color: #2196F3;
         }
-        .cyber-id-desc {
-            color: #666;
-            margin: 10px 0;
-        }
-        .error { color: red; }
     </style>
 </head>
 <body>
@@ -68,50 +59,74 @@
     </div>
 
     <script>
+        const CYBER_ABI = [
+            {
+                "inputs": [
+                    {
+                        "internalType": "uint256",
+                        "name": "tokenId",
+                        "type": "uint256"
+                    }
+                ],
+                "name": "labels",
+                "outputs": [
+                    {
+                        "internalType": "string",
+                        "name": "",
+                        "type": "string"
+                    }
+                ],
+                "stateMutability": "view",
+                "type": "function"
+            },
+            {
+                "inputs": [
+                    {
+                        "internalType": "uint256",
+                        "name": "tokenId",
+                        "type": "uint256"
+                    }
+                ],
+                "name": "tokenURI",
+                "outputs": [
+                    {
+                        "internalType": "string",
+                        "name": "",
+                        "type": "string"
+                    }
+                ],
+                "stateMutability": "view",
+                "type": "function"
+            }
+        ];
+
+        const CYBER_CONTRACT = '0xc137be6b59e824672aada673e55cf4d150669af8';
         const API_KEY = '3ccb00e2-963e-492a-bf0e-b4f5546e6c3c';
         const API_HOST = 'https://api.socialscan.io/cyber/v1/developer/api';
-        const CYBER_NFT_CONTRACT = '0xc137be6b59e824672aada673e55cf4d150669af8';
-        const METADATA_BASE_URL = 'https://metadata.cyberconnect.dev/nfts/cyberid/';
 
         async function fetchNFTTransfers(address) {
             const params = new URLSearchParams({
                 module: 'account',
                 action: 'tokennfttx',
-                contractaddress: CYBER_NFT_CONTRACT,
+                contractaddress: CYBER_CONTRACT,
                 address: address,
                 page: '1',
-                offset: '100',
-                startblock: '0',
-                endblock: '999999999',
+                offset: '1',
                 sort: 'desc'
             });
 
             const response = await fetch(`${API_HOST}?${params}`, {
-                headers: {
-                    'x-api-key': API_KEY
-                }
+                headers: { 'x-api-key': API_KEY }
             });
 
-            if (!response.ok) {
-                throw new Error(`API request failed: ${response.statusText}`);
-            }
-
+            if (!response.ok) throw new Error('API request failed');
             return await response.json();
-        }
-
-        async function fetchMetadata(tokenId) {
-            const response = await fetch(`${METADATA_BASE_URL}${tokenId}`);
-            if (!response.ok) {
-                throw new Error('Failed to fetch metadata');
-            }
-            return await response.json();
-        }
-
-        function formatDate(timestamp) {
-            return new Date(parseInt(timestamp)).toLocaleDateString();
         }
 
         window.onload = function() {
+            const web3 = new Web3('https://rpc.cyber.co');
+            const contract = new web3.eth.Contract(CYBER_ABI, CYBER_CONTRACT);
+
             document.getElementById('lookupBtn').onclick = async function() {
                 const resultDiv = document.getElementById('result');
                 const address = document.getElementById('addressInput').value;
@@ -119,40 +134,39 @@
                 resultDiv.innerHTML = 'Looking up...';
 
                 try {
-                    // Get NFT transfers
+                    // Get token ID from transfer events
                     const nftData = await fetchNFTTransfers(address);
-
-                    if (nftData.result && nftData.result.length > 0) {
-                        // Find last transfer to this address
-                        const lastTransfer = nftData.result.find(tx => 
-                            tx.to.toLowerCase() === address.toLowerCase()
-                        );
-
-                        if (lastTransfer) {
-                            // Get metadata
-                            const metadata = await fetchMetadata(lastTransfer.tokenID);
-                            
-                            resultDiv.innerHTML = `
-                                <div class="cyber-id-card">
-                                    <div class="cyber-id-name">${metadata.name}</div>
-                                    <img class="cyber-id-image" src="${metadata.image}" 
-                                         alt="${metadata.name}" 
-                                         onerror="this.src='/api/placeholder/200/200'"/>
-                                    <div class="cyber-id-desc">${metadata.description}</div>
-                                    <div>Created: ${formatDate(metadata.attributes.find(a => a.trait_type === 'Created Date')?.value)}</div>
-                                    <div>Token ID: ${lastTransfer.tokenID}</div>
-                                </div>
-                            `;
-                        } else {
-                            resultDiv.innerHTML = '<div class="error">No active Cyber ID found for this address</div>';
-                        }
-                    } else {
-                        resultDiv.innerHTML = '<div class="error">No Cyber ID transfers found for this address</div>';
+                    
+                    if (!nftData.result?.[0]) {
+                        resultDiv.innerHTML = 'No Cyber ID found';
+                        return;
                     }
+
+                    const tokenId = nftData.result[0].tokenID;
+
+                    // Get Cyber ID name
+                    const cyberName = await contract.methods.labels(tokenId).call();
+                    
+                    // Get metadata URI
+                    const metadataURI = await contract.methods.tokenURI(tokenId).call();
+                    
+                    // Fetch metadata
+                    const metadata = await fetch(metadataURI).then(r => r.json());
+
+                    resultDiv.innerHTML = `
+                        <div class="cyber-id-card">
+                            <div class="cyber-id-name">${cyberName}.cyber</div>
+                            <img class="cyber-id-image" 
+                                 src="${metadata.image}" 
+                                 alt="${cyberName}"
+                                 onerror="this.src='/api/placeholder/200/200'"/>
+                            <div>${metadata.description || ''}</div>
+                        </div>
+                    `;
 
                 } catch (error) {
                     console.error('Error:', error);
-                    resultDiv.innerHTML = `<div class="error">Error: ${error.message}</div>`;
+                    resultDiv.innerHTML = `Error: ${error.message}`;
                 }
             };
         };
