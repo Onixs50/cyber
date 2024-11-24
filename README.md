@@ -1,4 +1,6 @@
 ```bash
+chmod +x control.sh
+
 ./control.sh start     
 ./control.sh stop      
 ./control.sh restart   
