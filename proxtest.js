@@ -71,14 +71,14 @@ class ProxyManager {
         fs.appendFileSync(path.join('logs', CONFIG.LOG_FILE), logMessage);
     }
 
-    async checkProxy(proxy, retryCount = 0) {
+    async checkProxy(proxy, type = 'http', retryCount = 0) {
         try {
             const [host, port] = proxy.split(':');
             const proxyConfig = {
                 proxy: {
                     host,
                     port,
-                    protocol: 'http'
+                    protocol: type
                 },
                 timeout: CONFIG.TIMEOUT
             };
@@ -88,7 +88,7 @@ class ProxyManager {
         } catch (error) {
             if (retryCount < CONFIG.MAX_RETRIES) {
                 await new Promise(resolve => setTimeout(resolve, CONFIG.RETRY_DELAY));
-                return this.checkProxy(proxy, retryCount + 1);
+                return this.checkProxy(proxy, type, retryCount + 1);
             }
             return false;
         }
@@ -157,18 +157,24 @@ class ProxyManager {
         
         for (const proxy of newProxies) {
             if (!this.isRunning) return;
-            if (!this.workingProxies.has(proxy) && await this.checkProxy(proxy)) {
-                this.workingProxies.set(proxy, Date.now());
-                this.log(`✅ Added new working proxy: ${proxy}`);
-                this.saveProxies();
-                return true;
+            if (!this.workingProxies.has(proxy)) {
+                const proxyTypes = ['http', 'socks4', 'socks5'];
+                for (const type of proxyTypes) {
+                    if (await this.checkProxy(proxy, type)) {
+                        this.workingProxies.set(proxy, Date.now());
+                        this.log(`✅ Added new working ${type} proxy: ${proxy}`);
+                        this.saveProxies();
+                        return true;
+                    }
+                }
             }
         }
         return false;
     }
 
     saveProxies() {
-        const proxyList = Array.from(this.workingProxies.keys());
+        const proxyList = Array.from(this.workingProxies.keys())
+            .map(proxy => `${proxy}::`); // Add empty auth format
         fs.writeFileSync(CONFIG.PROXY_FILE, proxyList.join('\n'));
         this.log(`✅ Saved ${proxyList.length} working proxies to ${CONFIG.PROXY_FILE}`);
     }
@@ -207,36 +213,46 @@ class ProxyManager {
     }
 }
 
-// Export the manager for use with the service controller
 module.exports = new ProxyManager();
 
-// If running directly, start the manager
 if (require.main === module) {
     const manager = module.exports;
     manager.start();
 
-    // Handle graceful shutdown
     process.on('SIGTERM', () => {
         manager.stop();
         process.exit(0);
     });
 
-process.on('SIGINT', () => {
-       manager.stop();
-       process.exit(0);
-   });
+    process.on('SIGINT', () => {
+        manager.stop();
+        process.exit(0);
+    });
 
-   // Handle uncaught errors
-   process.on('uncaughtException', (error) => {
-       manager.log(`Uncaught error: ${error.message}`);
-       manager.stop();
-       process.exit(1); 
-   });
+    process.on('uncaughtException', (error) => {
+        manager.log(`Uncaught error: ${error.message}`);
+        manager.stop();
+        process.exit(1);
+    });
 
-   // Handle unhandled promise rejections
-   process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason, promise) => {
        manager.log(`Unhandled rejection: ${reason}`);
        manager.stop();
        process.exit(1);
    });
+
+   // Handle cleanup
+   process.on('exit', () => {
+       manager.log('Process exit detected, cleaning up...');
+       if (manager.isRunning) {
+           manager.stop();
+       }
+   });
+
+   // Handle memory cleanup
+   if (global.gc) {
+       setInterval(() => {
+           global.gc();
+       }, 30000);
+   }
 }
