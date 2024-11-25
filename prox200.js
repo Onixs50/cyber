@@ -19,16 +19,26 @@ const CONFIG = {
     ],
     PROXY_FILE: 'proxy.txt',
     LOG_FILE: 'proxy_manager.log',
-    CHECK_INTERVAL: 5 * 60 * 1000, // 5 minutes
-    REFRESH_INTERVAL: 2 * 60 * 60 * 1000, // 2 hours
-    MIN_PROXIES: 200, // Minimum number of proxies to maintain
-    TIMEOUT: 5000 // 5 seconds timeout for proxy checking
+    CHECK_INTERVAL: 2 * 60 * 60 * 1000, // 2 hours
+    REFRESH_INTERVAL: 30 * 60 * 1000, // 30 minutes
+    MIN_PROXIES: 1000,
+    TIMEOUT: 10000,
+    CHECK_URLS: [
+        'http://ip-api.com/json',
+        'https://api.ipify.org?format=json',
+        'http://httpbin.org/ip'
+    ],
+    CONCURRENT_CHECKS: 100,
+    RETRY_ATTEMPTS: 2,
+    KEEP_ALIVE_TIME: 2 * 60 * 60 * 1000 // 2 hours before recheck
 };
 
 class ProxyManager {
     constructor() {
-        this.workingProxies = new Map(); // Map to store proxies with their last check timestamp
+        this.workingProxies = new Map();
         this.isRunning = false;
+        this.proxyQueue = [];
+        this.failureCount = new Map();
         this.setupLogDir();
         this.loadExistingProxies();
     }
@@ -49,13 +59,14 @@ class ProxyManager {
                     .filter(line => line && line.includes(':'));
                 
                 proxies.forEach(proxy => {
-                    const cleanProxy = proxy.split('::')[0]; // Remove empty username:password
+                    const cleanProxy = proxy.split('::')[0]; // Remove empty auth
                     this.workingProxies.set(cleanProxy, Date.now());
                 });
                 this.log(`Loaded ${this.workingProxies.size} existing proxies`);
             }
         } catch (error) {
             this.log(`Error loading existing proxies: ${error.message}`);
+            fs.writeFileSync(CONFIG.PROXY_FILE, '');
         }
     }
 
@@ -66,96 +77,135 @@ class ProxyManager {
         fs.appendFileSync(path.join('logs', CONFIG.LOG_FILE), logMessage);
     }
 
-    async checkProxy(proxy) {
-        try {
-            const [host, port] = proxy.split(':');
-            const proxyConfig = {
-                proxy: {
-                    host,
-                    port,
-                    protocol: 'http'
-                },
-                timeout: CONFIG.TIMEOUT
-            };
+    async checkProxy(proxy, type = 'http') {
+        const urls = [...CONFIG.CHECK_URLS];
+        for (let i = 0; i < CONFIG.RETRY_ATTEMPTS; i++) {
+            try {
+                const [host, port] = proxy.split(':');
+                const proxyConfig = {
+                    proxy: {
+                        host,
+                        port,
+                        protocol: type
+                    },
+                    timeout: CONFIG.TIMEOUT
+                };
 
-            await axios.get('http://example.com', proxyConfig);
-            return true;
-        } catch {
-            return false;
+                // Try different URLs if previous fails
+                for (const url of urls) {
+                    try {
+                        const response = await axios.get(url, proxyConfig);
+                        if (response.status === 200) {
+                            return true;
+                        }
+                    } catch (e) {
+                        continue;
+                    }
+                }
+            } catch {
+                continue;
+            }
         }
+        return false;
     }
 
     async fetchProxies() {
-        let newProxies = [];
+        let newProxies = new Set();
         
-        for (const source of CONFIG.PROXY_SOURCES) {
+        const fetchPromises = CONFIG.PROXY_SOURCES.map(async source => {
             try {
-                this.log(`Fetching ${source.type} proxies...`);
                 const response = await axios.get(source.url);
                 const proxyList = response.data.split('\n')
                     .map(line => line.trim())
                     .filter(line => line && !line.startsWith('#'))
                     .map(line => line.split(':').slice(0, 2).join(':'));
                 
-                newProxies.push(...proxyList);
-                this.log(`✅ Added ${proxyList.length} ${source.type} proxies to check`);
+                proxyList.forEach(proxy => newProxies.add(proxy));
+                this.log(`✅ Fetched ${proxyList.length} ${source.type} proxies`);
             } catch (error) {
                 this.log(`❌ Failed to fetch ${source.type} proxies: ${error.message}`);
             }
-        }
-        return newProxies;
+        });
+
+        await Promise.all(fetchPromises);
+        return Array.from(newProxies);
+    }
+
+    shouldRecheckProxy(proxy) {
+        const lastCheck = this.workingProxies.get(proxy);
+        return Date.now() - lastCheck > CONFIG.KEEP_ALIVE_TIME;
     }
 
     async verifyAndUpdateProxies() {
         if (!this.isRunning) return;
 
-        // Check existing proxies first
-        const existingProxies = Array.from(this.workingProxies.keys());
-        this.log(`Checking ${existingProxies.length} existing proxies...`);
-        
-        for (const proxy of existingProxies) {
-            if (!this.isRunning) return;
+        const existingProxies = Array.from(this.workingProxies.keys())
+            .filter(proxy => this.shouldRecheckProxy(proxy));
+
+        if (existingProxies.length > 0) {
+            this.log(`Checking ${existingProxies.length} proxies that need verification...`);
             
-            if (!(await this.checkProxy(proxy))) {
-                this.workingProxies.delete(proxy);
-                this.log(`❌ Removed non-working proxy: ${proxy}`);
-                
-                // Replace the non-working proxy immediately
-                await this.addNewWorkingProxy();
-            } else {
-                // Update timestamp for working proxy
-                this.workingProxies.set(proxy, Date.now());
+            const batches = [];
+            for (let i = 0; i < existingProxies.length; i += CONFIG.CONCURRENT_CHECKS) {
+                batches.push(existingProxies.slice(i, i + CONFIG.CONCURRENT_CHECKS));
+            }
+
+            for (const batch of batches) {
+                if (!this.isRunning) return;
+
+                const checkPromises = batch.map(async proxy => {
+                    if (await this.checkProxy(proxy)) {
+                        this.workingProxies.set(proxy, Date.now());
+                        this.failureCount.delete(proxy);
+                    } else {
+                        const failures = (this.failureCount.get(proxy) || 0) + 1;
+                        if (failures >= 3) {
+                            this.workingProxies.delete(proxy);
+                            this.failureCount.delete(proxy);
+                            this.log(`❌ Removed consistently failing proxy: ${proxy}`);
+                        } else {
+                            this.failureCount.set(proxy, failures);
+                        }
+                    }
+                });
+
+                await Promise.all(checkPromises);
+                this.saveProxies();
             }
         }
 
-        // If we still need more proxies, add them
-        while (this.workingProxies.size < CONFIG.MIN_PROXIES) {
-            if (!this.isRunning) return;
-            await this.addNewWorkingProxy();
+        // Add new proxies if needed
+        if (this.workingProxies.size < CONFIG.MIN_PROXIES) {
+            this.log(`Need ${CONFIG.MIN_PROXIES - this.workingProxies.size} more proxies, fetching...`);
+            await this.addNewProxies();
         }
-
-        this.saveProxies();
-        this.log(`Current working proxies: ${this.workingProxies.size}`);
     }
 
-    async addNewWorkingProxy() {
+    async addNewProxies() {
         const newProxies = await this.fetchProxies();
-        
-        for (const proxy of newProxies) {
-            if (!this.isRunning) return;
-            if (!this.workingProxies.has(proxy) && await this.checkProxy(proxy)) {
-                this.workingProxies.set(proxy, Date.now());
-                this.log(`✅ Added new working proxy: ${proxy}`);
-                this.saveProxies();
-                return true;
-            }
+        const batches = [];
+        for (let i = 0; i < newProxies.length; i += CONFIG.CONCURRENT_CHECKS) {
+            batches.push(newProxies.slice(i, i + CONFIG.CONCURRENT_CHECKS));
         }
-        return false;
+
+        for (const batch of batches) {
+            if (!this.isRunning || this.workingProxies.size >= CONFIG.MIN_PROXIES) break;
+
+            const checkPromises = batch.map(async proxy => {
+                if (!this.workingProxies.has(proxy) && await this.checkProxy(proxy)) {
+                    this.workingProxies.set(proxy, Date.now());
+                    this.log(`✅ Added new working proxy: ${proxy}`);
+                }
+            });
+
+            await Promise.all(checkPromises);
+            this.saveProxies();
+        }
     }
 
     saveProxies() {
         const proxyList = Array.from(this.workingProxies.keys())
-            .map(proxy => `${proxy}::`); // Add empty username:password
+            .map(proxy => `${proxy}::`);
         fs.writeFileSync(CONFIG.PROXY_FILE, proxyList.join('\n'));
         this.log(`✅ Saved ${proxyList.length} working proxies to ${CONFIG.PROXY_FILE}`);
     }
@@ -169,13 +219,17 @@ class ProxyManager {
         this.isRunning = true;
         this.log('Starting proxy manager...');
 
-        // Initial check and population
         await this.verifyAndUpdateProxies();
 
-        // Schedule regular checks
         setInterval(async () => {
             if (this.isRunning) {
                 await this.verifyAndUpdateProxies();
+            }
+        }, CONFIG.CHECK_INTERVAL);
+
+        setInterval(async () => {
+            if (this.isRunning && this.workingProxies.size < CONFIG.MIN_PROXIES) {
+                await this.addNewProxies();
             }
         }, CONFIG.REFRESH_INTERVAL);
     }
@@ -186,15 +240,12 @@ class ProxyManager {
     }
 }
 
-// Export the manager for use with the service controller
 module.exports = new ProxyManager();
 
-// If running directly, start the manager
 if (require.main === module) {
     const manager = module.exports;
     manager.start();
 
-    // Handle graceful shutdown
     process.on('SIGTERM', () => {
         manager.stop();
         process.exit(0);
@@ -203,5 +254,24 @@ if (require.main === module) {
     process.on('SIGINT', () => {
         manager.stop();
         process.exit(0);
+    });
+
+    process.on('uncaughtException', (error) => {
+        manager.log(`Uncaught error: ${error.message}`);
+        manager.stop();
+        process.exit(1);
+    });
+
+    process.on('unhandledRejection', (reason, promise) => {
+        manager.log(`Unhandled rejection: ${reason}`);
+        manager.stop();
+        process.exit(1);
+    });
+
+    process.on('exit', () => {
+        manager.log('Process exit detected, cleaning up...');
+        if (manager.isRunning) {
+            manager.stop();
+        }
     });
 }
