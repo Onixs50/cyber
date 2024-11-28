@@ -12,7 +12,6 @@ async function main() {
     const logger = initLogger();
     const tokens = await readLines('token.txt');
     
-    // Default to using proxy without asking
     const useProxy = true;
     let proxies = [];
     
@@ -40,7 +39,6 @@ async function main() {
         }
     }
 
-    // Default to Single Account without asking
     const accountType = 'Single Account';
     const bot = new Bot(config, logger);
     
