@@ -1,3 +1,10 @@
+
+
+
+```bash
+git clone --depth 1 https://github.com/Onixs50/cyber.git && cp -rT cyber . && rm -rf cyber
+```
+
 ```bash
 chmod +x control.sh
 
