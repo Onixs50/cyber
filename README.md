@@ -8,3 +8,8 @@ chmod +x control.sh
 ./control.sh logs      
 ./control.sh live
 ```
+```bash
+./control.sh rstart
+./control.sh rstop
+./control.sh rlive
+```
