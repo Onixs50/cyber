@@ -14,6 +14,10 @@ class ProxyManager {
         this.setupPid();
         this.setupLogDir();
         this.loadExistingProxies();
+        
+        // تنظیمات تایم‌اوت و تعداد تلاش‌ها
+        this.timeout = 5000;  // 5 seconds timeout
+        this.retries = 2;     // تعداد تلاش برای هر پروکسی
     }
 
     setupPid() {
@@ -44,7 +48,7 @@ class ProxyManager {
                 const content = fs.readFileSync(this.proxyFile, 'utf8');
                 content.split('\n')
                     .map(line => line.trim())
-                    .filter(line => line && line.includes(':'))
+                    .filter(line => this.isValidProxyFormat(line))
                     .forEach(proxy => {
                         this.workingProxies.set(proxy, Date.now());
                     });
@@ -56,74 +60,113 @@ class ProxyManager {
         }
     }
 
-    async quickCheckProxy(proxy) {
-        try {
-            const [host, port] = proxy.split(':');
-            const response = await axios.get('http://ip-api.com/json', {
-                proxy: { host, port, protocol: 'http' },
-                timeout: 5000
-            });
-            return response.status === 200;
-        } catch {
-            return false;
+    isValidProxyFormat(proxy) {
+        if (!proxy || !proxy.includes(':')) return false;
+        const [host, port] = proxy.split(':');
+        const portNum = parseInt(port);
+        return (
+            host && 
+            host.match(/^(\d{1,3}\.){3}\d{1,3}$/) &&
+            !isNaN(portNum) && 
+            portNum >= 1 && 
+            portNum <= 65535
+        );
+    }
+
+    async verifyProxy(proxy, testUrls = ['http://example.com', 'https://api.ipify.org']) {
+        const [host, port] = proxy.split(':');
+        
+        for (let attempt = 0; attempt < this.retries; attempt++) {
+            for (const url of testUrls) {
+                try {
+                    const response = await axios.get(url, {
+                        proxy: {
+                            host,
+                            port: parseInt(port),
+                            protocol: 'http'
+                        },
+                        timeout: this.timeout,
+                        validateStatus: status => status >= 200 && status < 300
+                    });
+                    
+                    if (response.status === 200) {
+                        return true;
+                    }
+                } catch (error) {
+                    continue;
+                }
+            }
         }
+        return false;
     }
 
     async fetchAndCheckProxies() {
         this.log('Starting full proxy fetch and check...');
         const sources = [
             'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
-            'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt',
-            'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt'
+            'https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt',
+            'https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt',
+            'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt'
         ];
         
         const newProxies = new Set();
         
         for (const url of sources) {
             try {
-                const response = await axios.get(url);
+                const response = await axios.get(url, { timeout: 10000 });
                 response.data.split('\n')
                     .map(line => line.trim())
-                    .filter(line => line && !line.startsWith('#'))
-                    .map(line => line.split(':').slice(0, 2).join(':'))
+                    .filter(line => this.isValidProxyFormat(line))
                     .forEach(proxy => newProxies.add(proxy));
             } catch (error) {
-                this.log(`Failed to fetch from ${url}`);
+                this.log(`Failed to fetch from ${url}: ${error.message}`);
             }
         }
 
         const batches = Array.from(newProxies)
             .filter(proxy => !this.workingProxies.has(proxy));
 
-        for (let i = 0; i < batches.length; i += 200) {
-            const batch = batches.slice(i, i + 200);
+        let verifiedCount = 0;
+        for (let i = 0; i < batches.length; i += 50) {
+            const batch = batches.slice(i, i + 50);
             await Promise.all(batch.map(async proxy => {
-                if (await this.quickCheckProxy(proxy)) {
+                if (await this.verifyProxy(proxy)) {
                     this.workingProxies.set(proxy, Date.now());
-                    this.saveProxies();
+                    verifiedCount++;
+                    if (verifiedCount % 10 === 0) {
+                        this.saveProxies();  // Save every 10 verified proxies
+                    }
                 }
             }));
         }
+
+        this.log(`Verified ${verifiedCount} new working proxies`);
+        this.saveProxies();
     }
 
     async dailyCheck() {
         this.log('Starting daily check...');
         const proxies = Array.from(this.workingProxies.keys());
+        let removedCount = 0;
 
-        for (let i = 0; i < proxies.length; i += 200) {
-            const batch = proxies.slice(i, i + 200);
+        for (let i = 0; i < proxies.length; i += 50) {
+            const batch = proxies.slice(i, i + 50);
             await Promise.all(batch.map(async proxy => {
-                if (!await this.quickCheckProxy(proxy)) {
+                if (!await this.verifyProxy(proxy)) {
                     this.workingProxies.delete(proxy);
+                    removedCount++;
                 }
             }));
         }
+
+        this.log(`Removed ${removedCount} non-working proxies`);
         this.saveProxies();
     }
 
     saveProxies() {
         const proxyList = Array.from(this.workingProxies.keys()).join('\n');
         fs.writeFileSync(this.proxyFile, proxyList);
+        this.log(`Saved ${this.workingProxies.size} proxies to file`);
     }
 
     async start() {
@@ -133,17 +176,19 @@ class ProxyManager {
 
         await this.fetchAndCheckProxies();
 
+        // Check for new proxies every 2 hours
         setInterval(async () => {
             if (this.isRunning) {
                 await this.fetchAndCheckProxies();
             }
-        }, 7800000);
+        }, 7200000);
 
+        // Verify existing proxies every 12 hours
         setInterval(async () => {
             if (this.isRunning) {
                 await this.dailyCheck();
             }
-        }, 86400000);
+        }, 43200000);
     }
 
     stop() {
