@@ -15,9 +15,8 @@ class ProxyManager {
         this.setupLogDir();
         this.loadExistingProxies();
         
-        // تنظیمات تایم‌اوت و تعداد تلاش‌ها
-        this.timeout = 5000;  // 5 seconds timeout
-        this.retries = 2;     // تعداد تلاش برای هر پروکسی
+        this.timeout = 5000;  
+        this.retries = 2;
     }
 
     setupPid() {
